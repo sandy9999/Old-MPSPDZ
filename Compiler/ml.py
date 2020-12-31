@@ -264,7 +264,7 @@ class Output(NoVariableLayer):
                     lse.assign(approx_lse_0(x, self.approx) + x * (1 - y), base)
                 return
             if self.custom_back_prop:
-                x_2 = x*x
+                x_2 = 1 + x + 0.5*x*x
                 self.x_2.assign(x_2, base)
                 if self.compute_loss:
                     lse.assign(lse_0_from_x_2(-x, x_2) + x * (1 - y), base)
@@ -457,7 +457,7 @@ class MultiOutput(MultiOutputBase):
                 m = util.max(self.X[i])
                 mv = m.expand_to_vector(d_out)
                 x = self.X[i].get_vector()
-                x_2 = (x - mv > -get_limit(x)).if_else((x - mv)*(x - mv), 0)
+                x_2 = (x - mv > -get_limit(x)).if_else(1 + (x-mv) + 0.5*(x - mv)*(x - mv), 0)
                 self.x_square[i].assign_vector(x_2)
                 if self.compute_loss:
                     true_X = sfix.dot_product(self.Y[batch[i]], self.X[i])
@@ -488,7 +488,7 @@ class MultiOutput(MultiOutputBase):
         if self.custom_back_prop:
             @for_range_opt_multithread(self.n_threads, N)
             def _(i):
-                x_2 = (self.X[i].get_vector())*(self.X[i].get_vector())
+                x_2 = 1 + self.X[i].get_vector() + 0.5*(self.X[i].get_vector())*(self.X[i].get_vector())
                 res[i].assign_vector(x_2 / sum(x_2).expand_to_vector(d_out))
             return res
         @for_range_opt_multithread(self.n_threads, N)
