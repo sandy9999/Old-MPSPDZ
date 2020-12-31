@@ -81,6 +81,9 @@ def sigmoid(x):
 def sigmoid_from_e_x(x, e_x):
     return sanitize(x, 1 / (1 + e_x), 0, 1)
 
+def sigmoid_from_x_2(x, x_2):
+    return sanitize(x, 1 / (1 + x_2), 0, 1)
+
 def sigmoid_prime(x):
     """ Sigmoid derivative.
 
@@ -113,6 +116,9 @@ def approx_sigmoid(x, n=3):
 
 def lse_0_from_e_x(x, e_x):
     return sanitize(-x, log_e(1 + e_x), x + 2 ** -x.f, 0)
+
+def lse_0_from_x_2(x, x_2):
+    return sanitize(-x, log_e(1 + x_2), x + 2 ** -x.f, 0)
 
 def lse_0(x):
     return lse_0_from_e_x(x, exp(x))
@@ -226,16 +232,18 @@ class Output(NoVariableLayer):
         res.compute_loss = not 'no_loss' in program.args
         return res
 
-    def __init__(self, N, debug=False, approx=False):
+    def __init__(self, N, debug=False, approx=False, custom_back_prop=False):
         self.N = N
         self.X = sfix.Array(N)
         self.Y = sfix.Array(N)
         self.nabla_X = sfix.Array(N)
         self.l = MemValue(sfix(-1))
         self.e_x = sfix.Array(N)
+        self.x_2 = sfix.Array(N)
         self.debug = debug
         self.weights = None
         self.approx = approx
+        self.custom_back_prop = custom_back_prop
         self.compute_loss = True
 
     def divisor(self, divisor, size):
@@ -255,6 +263,11 @@ class Output(NoVariableLayer):
                 if self.compute_loss:
                     lse.assign(approx_lse_0(x, self.approx) + x * (1 - y), base)
                 return
+            if self.custom_back_prop:
+                x_2 = x*x
+                self.x_2.assign(x_2, base)
+                if self.compute_loss:
+                    lse.assign(lse_0_from_x_2(-x, x_2) + x * (1 - y), base)
             e_x = exp(-x)
             self.e_x.assign(e_x, base)
             if self.compute_loss:
@@ -265,6 +278,9 @@ class Output(NoVariableLayer):
     def eval(self, size, base=0):
         if self.approx:
             return approx_sigmoid(self.X.get_vector(base, size), self.approx)
+        elif self.custom_back_prop:
+            return sigmoid_from_x_2(self.X.get_vector(base, size),
+                                    self.x_2.get_vector(base, size))
         else:
             return sigmoid_from_e_x(self.X.get_vector(base, size),
                                     self.e_x.get_vector(base, size))
@@ -325,13 +341,14 @@ class Output(NoVariableLayer):
         return n_correct
 
 class MultiOutputBase(NoVariableLayer):
-    def __init__(self, N, d_out, approx=False, debug=False):
+    def __init__(self, N, d_out, approx=False, custom_back_prop=False, debug=False):
         self.X = sfix.Matrix(N, d_out)
         self.Y = sint.Matrix(N, d_out)
         self.nabla_X = sfix.Matrix(N, d_out)
         self.l = MemValue(sfix(-1))
         self.losses = sfix.Array(N)
         self.approx = None
+        self.custom_back_prop = None
         self.N = N
         self.d_out = d_out
         self.compute_loss = True
@@ -383,7 +400,7 @@ class MultiOutputBase(NoVariableLayer):
         if 'relu_out' in program.args:
             res = ReluMultiOutput(N, n_output)
         else:
-            res = MultiOutput(N, n_output, approx='approx' in program.args)
+            res = MultiOutput(N, n_output, approx='approx' in program.args, custom_back_prop='custom_back_prop' in program.args)
             res.cheaper_loss = 'mse' in program.args
         res.compute_loss = not 'no_loss' in program.args
         for arg in program.args:
@@ -400,10 +417,12 @@ class MultiOutput(MultiOutputBase):
     :param d_out: number of classes
     :param approx: use ReLU division instead of softmax for the loss
     """
-    def __init__(self, N, d_out, approx=False, debug=False):
+    def __init__(self, N, d_out, approx=False, custom_back_prop=False, debug=False):
         MultiOutputBase.__init__(self, N, d_out)
         self.exp = sfix.Matrix(N, d_out)
+        self.x_square = sfix.Matrix(N, d_out)
         self.approx = approx
+        self.custom_back_prop = custom_back_prop
         self.positives = sint.Matrix(N, d_out)
         self.relus = sfix.Matrix(N, d_out)
         self.cheaper_loss = False
@@ -434,6 +453,16 @@ class MultiOutput(MultiOutputBase):
                         div = relus / sum(relus).expand_to_vector(d_out)
                         self.losses[i] = -sfix.dot_product(
                             self.Y[batch[i]].get_vector(), log_e(div))
+            elif self.custom_back_prop:
+                m = util.max(self.X[i])
+                mv = m.expand_to_vector(d_out)
+                x = self.X[i].get_vector()
+                x_2 = (x - mv > -get_limit(x)).if_else((x - mv)*(x - mv), 0)
+                self.x_square[i].assign_vector(x_2)
+                if self.compute_loss:
+                    true_X = sfix.dot_product(self.Y[batch[i]], self.X[i])
+                    tmp[i] = m + log_e(sum(x_2)) - true_X
+                    self.true_X[i] = true_X
             else:
                 m = util.max(self.X[i])
                 mv = m.expand_to_vector(d_out)
@@ -455,6 +484,12 @@ class MultiOutput(MultiOutputBase):
                 relus = (self.X[i].get_vector() > 0).if_else(
                     self.X[i].get_vector(), 0)
                 res[i].assign_vector(relus / sum(relus).expand_to_vector(d_out))
+            return res
+        if self.custom_back_prop:
+            @for_range_opt_multithread(self.n_threads, N)
+            def _(i):
+                x_2 = (self.X[i].get_vector())*(self.X[i].get_vector())
+                res[i].assign_vector(x_2 / sum(x_2).expand_to_vector(d_out))
             return res
         @for_range_opt_multithread(self.n_threads, N)
         def _(i):
@@ -493,6 +528,15 @@ class MultiOutput(MultiOutputBase):
                 self.nabla_X[i] = -positives.if_else(raw, truths)
             self.maybe_debug_backward(batch)
             return
+        if self.custom_back_prop:
+            @for_range_opt_multithread(self.n_threads, len(batch))
+            def _(i):
+                for j in range(d_out):
+                    dividend = self.x_square[i][j]
+                    divisor = sum(self.x_square[i])
+                    div = (divisor > 0.1).if_else(dividend / divisor, 0)
+                    self.nabla_X[i][j] = (-self.Y[batch[i]][j] + div)
+                return
         @for_range_opt_multithread(self.n_threads, len(batch))
         def _(i):
             for j in range(d_out):
