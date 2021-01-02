@@ -64,7 +64,7 @@ def exp(x):
     return mpc_math.pow_fx(math.e, x)
 
 def sqr(x):
-    return mpc_math.pow_fx(x, 2)
+    return 1 + x + 0.5*mpc_math.pow_fx(x, 2)
 
 def get_limit(x):
     exp_limit = 2 ** (x.k - x.f - 1)
