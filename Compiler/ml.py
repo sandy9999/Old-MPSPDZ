@@ -63,6 +63,9 @@ def log_e(x):
 def exp(x):
     return mpc_math.pow_fx(math.e, x)
 
+def sqr(x):
+    return mpc_math.pow_fx(x, 2)
+
 def get_limit(x):
     exp_limit = 2 ** (x.k - x.f - 1)
     return math.log(exp_limit)
@@ -325,13 +328,14 @@ class Output(NoVariableLayer):
         return n_correct
 
 class MultiOutputBase(NoVariableLayer):
-    def __init__(self, N, d_out, approx=False, debug=False):
+    def __init__(self, N, d_out, approx=False, custom_back_prop=False, debug=False):
         self.X = sfix.Matrix(N, d_out)
         self.Y = sint.Matrix(N, d_out)
         self.nabla_X = sfix.Matrix(N, d_out)
         self.l = MemValue(sfix(-1))
         self.losses = sfix.Array(N)
         self.approx = None
+        self.custom_back_prop = None
         self.N = N
         self.d_out = d_out
         self.compute_loss = True
@@ -383,7 +387,7 @@ class MultiOutputBase(NoVariableLayer):
         if 'relu_out' in program.args:
             res = ReluMultiOutput(N, n_output)
         else:
-            res = MultiOutput(N, n_output, approx='approx' in program.args)
+            res = MultiOutput(N, n_output, approx='approx' in program.args, custom_back_prop='custom_back_prop' in program.args)
             res.cheaper_loss = 'mse' in program.args
         res.compute_loss = not 'no_loss' in program.args
         for arg in program.args:
@@ -400,12 +404,14 @@ class MultiOutput(MultiOutputBase):
     :param d_out: number of classes
     :param approx: use ReLU division instead of softmax for the loss
     """
-    def __init__(self, N, d_out, approx=False, debug=False):
+    def __init__(self, N, d_out, approx=False, custom_back_prop=False, debug=False):
         MultiOutputBase.__init__(self, N, d_out)
         self.exp = sfix.Matrix(N, d_out)
         self.approx = approx
+        self.custom_back_prop = custom_back_prop
         self.positives = sint.Matrix(N, d_out)
         self.relus = sfix.Matrix(N, d_out)
+        self.x_2 = sfix.Matrix(N, d_out)
         self.cheaper_loss = False
         self.debug = debug
         self.true_X = sfix.Array(N)
@@ -434,6 +440,24 @@ class MultiOutput(MultiOutputBase):
                         div = relus / sum(relus).expand_to_vector(d_out)
                         self.losses[i] = -sfix.dot_product(
                             self.Y[batch[i]].get_vector(), log_e(div))
+            elif self.custom_back_prop:
+                if self.cheaper_loss or isinstance(self.custom_back_prop, float):
+                    limit = 0
+                else:
+                    limit = 0.1
+                positives = self.X[i].get_vector() > limit
+                x_2 = positives.if_else(sqr(self.X[i].get_vector()), 0)
+                self.positives[i].assign_vector(positives)
+                self.x_2[i].assign_vector(x_2)
+                if self.compute_loss:
+                    if self.cheaper_loss:
+                        s = sum(x_2)
+                        tmp[i] = sum((self.Y[batch[i]][j] * s - x_2[j]) ** 2
+                                     for j in range(d_out)) / s ** 2 * 0.5
+                    else:
+                        div = x_2 / sum(x_2).expand_to_vector(d_out)
+                        self.losses[i] = -sfix.dot_product(
+                            self.Y[batch[i]].get_vector(), log_e(div))
             else:
                 m = util.max(self.X[i])
                 mv = m.expand_to_vector(d_out)
@@ -455,6 +479,13 @@ class MultiOutput(MultiOutputBase):
                 relus = (self.X[i].get_vector() > 0).if_else(
                     self.X[i].get_vector(), 0)
                 res[i].assign_vector(relus / sum(relus).expand_to_vector(d_out))
+            return res
+        if self.custom_back_prop:
+            @for_range_opt_multithread(self.n_threads, N)
+            def _(i):
+                x_2 = (self.X[i].get_vector() > 0).if_else(
+                    self.X[i].get_vector(), 0)
+                res[i].assign_vector(x_2 / sum(x_2).expand_to_vector(d_out))
             return res
         @for_range_opt_multithread(self.n_threads, N)
         def _(i):
@@ -490,6 +521,35 @@ class MultiOutput(MultiOutputBase):
                 inv = (1 / sum(relus)).expand_to_vector(d_out)
                 truths = self.Y[batch[i]].get_vector()
                 raw = truths / relus - inv
+                self.nabla_X[i] = -positives.if_else(raw, truths)
+            self.maybe_debug_backward(batch)
+            return
+        if self.custom_back_prop:
+            @for_range_opt_multithread(self.n_threads, len(batch))
+            def _(i):
+                if self.cheaper_loss:
+                    s = sum(self.x_2[i])
+                    ss = s * s * s
+                    inv = 1 / ss
+                    @for_range_opt(d_out)
+                    def _(j):
+                        res = 0
+                        for k in range(d_out):
+                            x_2_k = self.x_2[i][k]
+                            summand = x_2_k - self.Y[batch[i]][k] * s
+                            summand *= (sfix.from_sint(j == k) - x_2_k)
+                            res += summand
+                        fallback = -self.Y[batch[i]][j]
+                        res *= inv
+                        self.nabla_X[i][j] = self.positives[i][j].if_else(res, fallback)
+                    return
+                x_2 = self.x_2[i].get_vector()
+                if isinstance(self.custom_back_prop, float):
+                    x_2 += self.custom_back_prop
+                positives = self.positives[i].get_vector()
+                inv = (1 / sum(x_2)).expand_to_vector(d_out)
+                truths = self.Y[batch[i]].get_vector()
+                raw = truths / x_2 - inv
                 self.nabla_X[i] = -positives.if_else(raw, truths)
             self.maybe_debug_backward(batch)
             return
