@@ -109,7 +109,7 @@ def approx_sigmoid(x, n=3):
     else:
         a = x < -0.5
         b = x > 0.5
-        return a.if_else(0, b.if_else(1, 0.5 + x))
+        return a.if_else(0, b.if_else(1, 0.5 + x/4 - (x**3)/48 + (x**5)/480 - 17*(x**7)/80640 + 31*(x**9)/1451520))
 
 def lse_0_from_e_x(x, e_x):
     return sanitize(-x, log_e(1 + e_x), x + 2 ** -x.f, 0)
